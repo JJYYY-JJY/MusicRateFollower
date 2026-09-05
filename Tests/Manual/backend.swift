@@ -32,14 +32,16 @@ import Foundation
                 try HAL.write(1, kAudioHardwarePropertyDefaultOutputDevice, original.id)
                 try wait("default output did not switch") { try HAL.defaultDevice() == original.id }
                 let candidates: [Double] = [44100, 48000, 88200, 96000, 176400, 192000]
-                var targets: [(Double, DeviceState)] = []
+                let baseline = try DeviceState.read(original.id)
+                var sources: [Double] = []
                 var unsupported: [Double] = []
                 for source in candidates {
-                    do { targets.append((source, try original.target(source))) } catch AudioFailure
-                        .unsupported
-                    { unsupported.append(source) }
+                    do {
+                        _ = try baseline.target(source)
+                        sources.append(source)
+                    } catch AudioFailure.unsupported { unsupported.append(source) }
                 }
-                guard !targets.isEmpty else {
+                guard !sources.isEmpty else {
                     print("SKIP", original.uid, "no controllable lossless source formats")
                     continue
                 }
@@ -51,7 +53,9 @@ import Foundation
                     print(Date(), original.uid, $0)
                 }
                 c.start()
-                for (source, expected) in targets {
+                for source in sources {
+                    let current = try DeviceState.read(original.id)
+                    let expected = try current.target(source)
                     c.source = SourceFormat(rate: source, bits: 24, item: "backend-\(source)")
                     c.reconcile()
                     try wait("full format was not verified for \(source)") {
@@ -88,7 +92,16 @@ import Foundation
                     try DeviceState.read(original.id) == original, "did not restore first snapshot")
                 print("PASS", original.uid, "multi-track first-snapshot restore")
 
-                guard let (source, alternate) = targets.first(where: { $0.1 != original }) else {
+                let restored = try DeviceState.read(original.id)
+                var alternateTarget: (Double, DeviceState)?
+                for source in sources {
+                    let target = try restored.target(source)
+                    if target != restored {
+                        alternateTarget = (source, target)
+                        break
+                    }
+                }
+                guard let (source, alternate) = alternateTarget else {
                     print("SKIP", original.uid, "no alternate full format for external takeover")
                     continue
                 }
@@ -96,7 +109,7 @@ import Foundation
                 c.start()
                 c.source = nil
                 c.reconcile()  // Observe the device before an external writer changes it.
-                try alternate.writeChanges(from: original)
+                try alternate.writeChanges(from: restored)
                 try wait("external change not observed") {
                     try DeviceState.read(original.id) == alternate
                         && lines.contains { $0.hasPrefix("yielded:") }

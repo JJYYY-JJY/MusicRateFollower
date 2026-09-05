@@ -115,6 +115,54 @@ final class RegressionTests: XCTestCase {
         }
     }
 
+    func testProductionTargetPreservesCurrentPhysicalFormatAcrossTracks() throws {
+        var initial = FakeAudio.device()
+        initial.streams[0].physical.mFormatFlags =
+            kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked
+        let rates: [Double] = [44100, 48000, 88200]
+        func option(_ rate: Double, _ bits: UInt32, floating: Bool = false)
+            -> AudioStreamRangedDescription
+        {
+            var format = initial.streams[0].physical
+            format.mSampleRate = rate
+            format.mBitsPerChannel = bits
+            format.mBytesPerFrame = bits / 8 * format.mChannelsPerFrame
+            format.mBytesPerPacket = format.mBytesPerFrame
+            if floating { format.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked }
+            return AudioStreamRangedDescription(
+                mFormat: format, mSampleRateRange: AudioValueRange(mMinimum: rate, mMaximum: rate))
+        }
+        func target(_ state: DeviceState, _ rate: Double) throws -> DeviceState {
+            try state.target(
+                rate,
+                nominalRates: { _ in
+                    rates.map { AudioValueRange(mMinimum: $0, mMaximum: $0) }
+                },
+                streamFormats: { _, selector in
+                    if selector == kAudioStreamPropertyAvailableVirtualFormats {
+                        return rates.map { option($0, 32, floating: true) }
+                    }
+                    return [
+                        option(44100, 32), option(48000, 24), option(88200, 24), option(88200, 32),
+                    ]
+                })
+        }
+        var expected = initial
+        expected.rate = 48000
+        expected.streams[0].physical = option(48000, 24).mFormat
+        expected.streams[0].virtual = option(48000, 32, floating: true).mFormat
+        let first = try target(initial, 48000)
+        XCTAssertEqual(first, expected)
+
+        expected.rate = 88200
+        expected.streams[0].physical = option(88200, 24).mFormat
+        expected.streams[0].virtual = option(88200, 32, floating: true).mFormat
+        XCTAssertEqual(try target(first, 88200), expected)
+
+        expected.streams[0].physical = option(88200, 32).mFormat
+        XCTAssertEqual(try target(initial, 88200), expected)
+    }
+
     func testProductionTargetUsesAllStreamCapabilities() throws {
         let state = FakeAudio.device()
         let rates: [Double] = [44100, 48000, 88200, 96000, 176400]

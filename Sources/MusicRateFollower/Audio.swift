@@ -224,22 +224,44 @@ struct DeviceState: Equatable {
                 && (sameFormat(s.virtual, b.virtual) || sameFormat(s.virtual, a.virtual))
         }
     }
-    func writeChanges(from old: Self) throws {
-        guard try HAL.string(id, kAudioDevicePropertyDeviceUID) == uid else {
+    func writeChanges(
+        from old: Self,
+        readUID: (AudioDeviceID) throws -> String = {
+            try HAL.string($0, kAudioDevicePropertyDeviceUID)
+        },
+        readRate: (AudioDeviceID) throws -> Double = {
+            try HAL.one($0, kAudioDevicePropertyNominalSampleRate, Double.self)
+        },
+        readVirtual: (AudioStreamID) throws -> AudioStreamBasicDescription = {
+            try HAL.one($0, kAudioStreamPropertyVirtualFormat, AudioStreamBasicDescription.self)
+        },
+        writeRate: (AudioDeviceID, Double) throws -> Void = {
+            try HAL.write($0, kAudioDevicePropertyNominalSampleRate, $1)
+        },
+        writeFormat: (AudioStreamID, AudioObjectPropertySelector, AudioStreamBasicDescription)
+            throws
+            -> Void = { try HAL.write($0, $1, $2) }
+    ) throws {
+        guard try readUID(id) == uid else {
             throw AudioFailure.changed
         }
-        for (a, b) in zip(streams, old.streams) where !sameFormat(a.physical, b.physical) {
-            try HAL.write(a.id, kAudioStreamPropertyPhysicalFormat, a.physical)
-        }
-        if try HAL.one(id, kAudioDevicePropertyNominalSampleRate, Double.self) != rate {
-            try HAL.write(id, kAudioDevicePropertyNominalSampleRate, rate)
+        var resetsPhysical = false
+        if try readRate(id) != rate {
+            try writeRate(id, rate)
+            resetsPhysical = true
         }
         for s in streams {
-            let actual = try HAL.one(
-                s.id, kAudioStreamPropertyVirtualFormat, AudioStreamBasicDescription.self)
+            let actual = try readVirtual(s.id)
             if !sameFormat(actual, s.virtual) {
-                try HAL.write(s.id, kAudioStreamPropertyVirtualFormat, s.virtual)
+                try writeFormat(s.id, kAudioStreamPropertyVirtualFormat, s.virtual)
+                resetsPhysical = true
             }
+        }
+        // Rate/virtual writes can renegotiate physical bit depth. Submit the
+        // physical formats last, even when they matched the starting snapshot.
+        for (a, b) in zip(streams, old.streams)
+        where resetsPhysical || !sameFormat(a.physical, b.physical) {
+            try writeFormat(a.id, kAudioStreamPropertyPhysicalFormat, a.physical)
         }
     }
 }

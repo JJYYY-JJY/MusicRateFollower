@@ -92,6 +92,60 @@ final class FakeAudio {
 }
 
 final class FailurePathTests: XCTestCase {
+    func testProductionWritesPreservePhysicalFormatAfterDriverRenegotiation() throws {
+        var original = FakeAudio.device()
+        original.rate = 48000
+        original.streams[0].physical.mSampleRate = 48000
+        original.streams[0].physical.mFormatFlags =
+            kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked
+        original.streams[0].physical.mBitsPerChannel = 16
+        original.streams[0].physical.mBytesPerFrame = 4
+        original.streams[0].physical.mBytesPerPacket = 4
+        original.streams[0].virtual.mSampleRate = 48000
+        var target = original
+        target.rate = 44100
+        target.streams[0].physical.mSampleRate = 44100
+        target.streams[0].physical.mBitsPerChannel = 24
+        target.streams[0].physical.mBytesPerFrame = 6
+        target.streams[0].physical.mBytesPerPacket = 6
+        target.streams[0].virtual.mSampleRate = 44100
+        // Also cover a virtual-only change: physical initially matches the
+        // target but the virtual setter renegotiates it to 32-bit anyway.
+        var virtualOnly = target
+        virtualOnly.streams[0].virtual.mSampleRate = 48000
+        for (before, after) in [(original, target), (target, original), (virtualOnly, target)] {
+            var actual = before
+            var pending: [() -> Void] = []
+            func renegotiate(_ rate: Double) {
+                actual.rate = rate
+                actual.streams[0].virtual.mSampleRate = rate
+                actual.streams[0].physical.mSampleRate = rate
+                actual.streams[0].physical.mBitsPerChannel = 32
+                actual.streams[0].physical.mBytesPerFrame = 8
+                actual.streams[0].physical.mBytesPerPacket = 8
+            }
+            try after.writeChanges(
+                from: before, readUID: { _ in actual.uid }, readRate: { _ in actual.rate },
+                readVirtual: { _ in actual.streams[0].virtual },
+                writeRate: { _, rate in
+                    pending.append { renegotiate(rate) }
+                },
+                writeFormat: { _, selector, format in
+                    pending.append {
+                        if selector == kAudioStreamPropertyVirtualFormat {
+                            renegotiate(format.mSampleRate)
+                            actual.streams[0].virtual = format
+                        } else {
+                            actual.streams[0].physical = format
+                        }
+                    }
+                })
+            XCTAssertEqual(actual, before, "setter return does not establish completion")
+            for complete in pending { complete() }
+            XCTAssertEqual(actual, after, "full format must survive rate/virtual renegotiation")
+        }
+    }
+
     private func pump(_ seconds: Double = 0.05) {
         RunLoop.main.run(until: Date().addingTimeInterval(seconds))
     }
