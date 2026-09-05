@@ -7,7 +7,9 @@ import OSLog
 let logger = Logger(subsystem: "local.MusicRateFollower", category: "state")
 func status(_ message: String) {
     logger.notice("\(message,privacy:.public)")
-    print("\(ISO8601DateFormatter().string(from:Date())) \(message)")
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    print("\(formatter.string(from: Date())) \(message)")
 }
 
 final class Follower {
@@ -26,6 +28,9 @@ final class Follower {
     init(diagnostic: Bool) {
         audio.diagnostic = diagnostic
         audio.onStatus = status
+        evidence.onInvalidated = { stamp in
+            status("log evidence invalidated; waiting for records after \(stamp)")
+        }
         evidence.onCancelHistory = { [weak self] in
             self?.history?.stop()
             self?.history = nil
@@ -165,19 +170,15 @@ final class Follower {
     }
     private func record(_ x: [String: Any], gen: UUID, fromHistory: Bool = false) {
         guard generation == gen, let app = music, !app.isTerminated else { return }
-        let acceptedOrigin = !sleeping && (!fromHistory || evidence.bootstrapping)
         evidence.receive(x, pid: app.processIdentifier, fromHistory: fromHistory)
-        if acceptedOrigin, x["eventType"] as? String == "lossEvent" {
-            status("log evidence invalidated; waiting for records after \(evidence.lastStamp)")
-        }
         applySource()
     }
     private func finishBootstrap(gen: UUID, success: Bool) {
-        guard generation == gen, evidence.bootstrapping, let app = music else { return }
+        guard generation == gen, evidence.bootstrapping, music != nil else { return }
         history = nil
-        evidence.finish(success: success, pid: app.processIdentifier)
+        let accepted = evidence.finish(success: success)
         status(
-            success
+            accepted
                 ? "bootstrap complete (up to 30 minutes of current Music process)"
                 : "bootstrap unavailable: waiting for fresh playback events")
         applySource()

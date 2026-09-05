@@ -44,14 +44,139 @@ final class RegressionTests: XCTestCase {
         let path = Bundle.module.url(
             forResource: "stream", withExtension: "ndjson", subdirectory: "Fixtures")!
         let text = try String(contentsOf: path, encoding: .utf8)
-        var d = Detection()
-        var rates = Set<Double>()
-        for line in text.split(separator: "\n") {
-            let x = try JSONSerialization.jsonObject(with: Data(line.utf8)) as! [String: Any]
-            d.consume(x, pid: 80157)
-            if let t = d.target { rates.insert(t.rate) }
+        let records = try text.split(separator: "\n").map {
+            try JSONSerialization.jsonObject(with: Data($0.utf8)) as! [String: Any]
         }
-        XCTAssertEqual(rates, [44100, 48000, 96000, 192000])
+        // Reviewed against the raw fixture. LKR never receives positive-rate evidence;
+        // NX is silent artwork. Neither may authorize a target.
+        let intervals: [(ClosedRange<Int>, String, Double, Int)] = [
+            (21...21, "I/IWA.01", 44100, 16), (27...32, "I/IRX.01", 44100, 16),
+            (37...141, "I/LXL.01", 192000, 24), (235...239, "I/GAB.01", 48000, 24),
+            (240...312, "I/GAB.01", 192000, 24), (317...333, "I/ZDD.01", 48000, 24),
+            (334...343, "I/ZDD.01", 192000, 24), (349...349, "I/XMF.01", 48000, 24),
+            (350...350, "I/XMF.01", 96000, 24), (352...352, "I/XMF.01", 96000, 24),
+            (354...355, "I/XMF.01", 96000, 24), (357...357, "I/XMF.01", 96000, 24),
+            (359...359, "I/XMF.01", 96000, 24),
+        ]
+        func expected(_ line: Int) -> SourceFormat? {
+            intervals.first { $0.0.contains(line) }.map {
+                SourceFormat(rate: $0.2, bits: $0.3, item: $0.1)
+            }
+        }
+        let e = PlaybackEvidence()
+        e.begin()
+        e.finish(success: true)
+        let f = FakeAudio(writeLimit: 8)
+        f.partialFailure = false
+        let c = f.controller()
+        for (index, record) in records.enumerated() {
+            e.receive(record, pid: 80157)
+            XCTAssertEqual(e.target, expected(index + 1), "fixture line \(index + 1)")
+            c.source = e.target
+            c.reconcile()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.001))
+            let count = f.writes.count
+            e.receive(record, pid: 80157)  // Exact replay must not change state or write again.
+            c.source = e.target
+            c.reconcile()
+            XCTAssertEqual(f.writes.count, count, "duplicate at line \(index + 1)")
+        }
+        XCTAssertEqual(f.writes, [192000, 48000, 192000, 48000, 192000, 48000, 96000])
+        XCTAssertTrue(
+            f.writtenStates.allSatisfy { state in
+                state.id == 78
+                    && state.streams.allSatisfy {
+                        $0.physical.mSampleRate == state.rate
+                            && $0.virtual.mSampleRate == state.rate
+                    }
+            })
+        var stopped = false
+        c.stop { stopped = true }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        XCTAssertTrue(stopped)
+        XCTAssertEqual(f.writtenStates.last, FakeAudio.device(), "final write is restoration")
+
+        // Reverse history, overlap it with live records, then continue live playback.
+        for split in [21, 37, 145, 189, 240, 350, 360] {
+            let replay = PlaybackEvidence()
+            replay.begin()
+            for record in records.prefix(split).reversed() {
+                replay.receive(record, pid: 80157, fromHistory: true)
+                replay.receive(record, pid: 80157)
+                XCTAssertNil(replay.target)
+            }
+            replay.finish(success: true)
+            XCTAssertEqual(replay.target, expected(split), "bootstrap through line \(split)")
+            for (index, record) in records.enumerated() {
+                replay.receive(record, pid: 80157)
+                XCTAssertEqual(
+                    replay.target, expected(max(split, index + 1)), "replay line \(index + 1)")
+            }
+        }
+    }
+
+    func testProductionTargetUsesAllStreamCapabilities() throws {
+        let state = FakeAudio.device()
+        let rates: [Double] = [44100, 48000, 88200, 96000, 176400]
+        func ranges(_ values: [Double]) -> [AudioValueRange] {
+            values.map { AudioValueRange(mMinimum: $0, mMaximum: $0) }
+        }
+        func formats(_ values: [Double], _ format: AudioStreamBasicDescription)
+            -> [AudioStreamRangedDescription]
+        {
+            ranges(values).map {
+                AudioStreamRangedDescription(mFormat: format, mSampleRateRange: $0)
+            }
+        }
+        let full = try state.target(
+            192000, nominalRates: { _ in ranges(rates) },
+            streamFormats: { _, _ in
+                formats(rates, state.streams[0].physical)
+            })
+        XCTAssertEqual(full.rate, 96000, "highest integer division, not 176400 maximum")
+        XCTAssertEqual(full.streams[0].physical.mSampleRate, 96000)
+        XCTAssertEqual(full.streams[0].virtual.mSampleRate, 96000)
+        var multi = state
+        multi.streams.append(
+            StreamState(
+                id: 90, physical: state.streams[0].physical, virtual: state.streams[0].virtual))
+        let limited = try multi.target(
+            192000, nominalRates: { _ in ranges(rates) },
+            streamFormats: { id, selector in
+                formats(
+                    id == 90 && selector == kAudioStreamPropertyAvailableVirtualFormats
+                        ? [48000] : rates,
+                    state.streams[0].physical)
+            })
+        XCTAssertEqual(limited.rate, 48000)
+        for selector in [
+            kAudioStreamPropertyAvailablePhysicalFormats,
+            kAudioStreamPropertyAvailableVirtualFormats,
+        ] {
+            XCTAssertThrowsError(
+                try multi.target(
+                    192000, nominalRates: { _ in ranges(rates) },
+                    streamFormats: { id, property in
+                        formats(
+                            id == 90 && property == selector ? [44100] : [48000],
+                            state.streams[0].physical)
+                    }))
+        }
+        XCTAssertThrowsError(
+            try state.target(
+                192000, nominalRates: { _ in ranges([44100]) },
+                streamFormats: { _, _ in
+                    formats([48000], state.streams[0].physical)
+                }))
+        var inadequate = state.streams[0].physical
+        inadequate.mFormatFlags = kAudioFormatFlagIsSignedInteger
+        inadequate.mBitsPerChannel = 16
+        XCTAssertThrowsError(
+            try state.target(
+                192000, nominalRates: { _ in ranges(rates) },
+                streamFormats: { _, _ in
+                    formats(rates, inadequate)
+                }))
     }
     func event(_ m: String, pid: Int = 123) -> [String: Any] {
         [

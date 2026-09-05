@@ -3,7 +3,7 @@ import XCTest
 
 @testable import MusicRateFollower
 
-private final class FakeAudio {
+final class FakeAudio {
     static func device(_ id: UInt32 = 78, _ uid: String = "speaker") -> DeviceState {
         let f = AudioStreamBasicDescription(
             mSampleRate: 44100, mFormatID: kAudioFormatLinearPCM, mFormatFlags: 9,
@@ -18,7 +18,10 @@ private final class FakeAudio {
     var failingSelector: UInt32?
     var partialFailure = true
     var holdPartialWithoutError = false
-    var writes: [Double] = []
+    var writtenStates: [DeviceState] = []
+    var writes: [Double] { writtenStates.map(\.rate) }
+    let writeLimit: Int
+    init(writeLimit: Int) { self.writeLimit = writeLimit }
     var callbacks: [(UInt32, AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
     var added: [UInt32] = []
     var removed: [UInt32] = []
@@ -44,10 +47,10 @@ private final class FakeAudio {
             return next
         }
         a.write = { next, before in
-            self.writes.append(next.rate)
+            self.writtenStates.append(next)
             self.deviceListenersAtWrite.append(self.callbacks.filter { $0.0 != 1 }.count)
             // Cap write attempts so a retry regression cannot loop indefinitely.
-            guard self.writes.count < 8 else { throw AudioFailure.changed }
+            guard self.writes.count <= self.writeLimit else { throw AudioFailure.changed }
             self.states[next.id]!.streams[0].physical = next.streams[0].physical
             self.notify()
             if next.rate != 44100 {
@@ -100,7 +103,7 @@ final class FailurePathTests: XCTestCase {
     }
 
     func testPartialWriteRollbackDoesNotReacquireFromOwnNotifications() {
-        let f = FakeAudio()
+        let f = FakeAudio(writeLimit: 8)
         let c = f.controller()
         c.reconcile()
         pump()
@@ -126,7 +129,7 @@ final class FailurePathTests: XCTestCase {
         stop(c)
     }
     func testVerificationTimeoutRollbackAlsoYields() {
-        let f = FakeAudio()
+        let f = FakeAudio(writeLimit: 8)
         f.partialFailure = false
         f.holdPartialWithoutError = true
         let c = f.controller()
@@ -140,7 +143,7 @@ final class FailurePathTests: XCTestCase {
         stop(c)
     }
     func testCriticalDeviceListenerFailurePreventsWritesAndCleansPartialRegistration() {
-        let f = FakeAudio()
+        let f = FakeAudio(writeLimit: 8)
         f.partialFailure = false
         f.failingSelector = kAudioStreamPropertyVirtualFormat
         let c = f.controller()
@@ -156,7 +159,7 @@ final class FailurePathTests: XCTestCase {
         stop(c)
     }
     func testSystemListenerFailurePreventsWrites() {
-        let f = FakeAudio()
+        let f = FakeAudio(writeLimit: 8)
         f.failingSelector = kAudioHardwarePropertyDevices
         let c = f.controller()
         c.reconcile()
@@ -166,7 +169,7 @@ final class FailurePathTests: XCTestCase {
         stop(c)
     }
     func testTransientFirstReadCannotBypassRequiredDeviceListeners() {
-        let f = FakeAudio()
+        let f = FakeAudio(writeLimit: 8)
         f.partialFailure = false
         f.failingReads = [1]
         f.failingSelector = kAudioStreamPropertyVirtualFormat
@@ -185,7 +188,7 @@ final class FailurePathTests: XCTestCase {
         XCTAssertEqual(f.states[78], FakeAudio.device())
 
         // A transient read failure may recover when all required listeners succeed.
-        let healthy = FakeAudio()
+        let healthy = FakeAudio(writeLimit: 8)
         healthy.partialFailure = false
         healthy.failingReads = [1]
         let retry = healthy.controller()
@@ -199,7 +202,7 @@ final class FailurePathTests: XCTestCase {
         XCTAssertEqual(healthy.states[78], FakeAudio.device())
     }
     func testOldTimeoutCannotAbandonNewRestoreTransactionDuringStop() {
-        let f = FakeAudio()
+        let f = FakeAudio(writeLimit: 8)
         let restoreStarted = expectation(description: "restore transaction started")
         var a = f.access()
         var requested: DeviceState?
@@ -212,7 +215,7 @@ final class FailurePathTests: XCTestCase {
             return f.states[id]!
         }
         a.write = { next, _ in
-            f.writes.append(next.rate)
+            f.writtenStates.append(next)
             f.states[next.id]!.streams[0].physical = next.streams[0].physical
             if next.rate == 48000 { requested = next } else { restoreStarted.fulfill() }
             // Completion is deliberately delayed; no notification resolves it early.
@@ -245,7 +248,7 @@ final class FailurePathTests: XCTestCase {
         XCTAssertTrue(f.statuses.contains { $0.hasPrefix("restored") })
     }
     func testNormalDeviceReturnAllowsReacquisitionAndExternalChangeStillYields() {
-        let f = FakeAudio()
+        let f = FakeAudio(writeLimit: 8)
         f.partialFailure = false
         let c = f.controller()
         c.reconcile()
@@ -273,11 +276,8 @@ final class FailurePathTests: XCTestCase {
     }
 
     private func records(_ start: UInt64) -> [[String: Any]] {
-        let messages = [
-            "<<<< AVPlayer >>>> -[AVPlayer _setCurrentItem:]: <P/JK|0x123> currentItem KVO: updating current item from (null) to I/A",
-            "<<<< FigStreamPlayer >>>> fpfs_SetRateOnTrack: [0x123|P/JK] <0x456|I/A>: rate 1.000000 set on track 1 (audio)",
-            "<<<< FigStreamPlayer >>>> fpfs_ReportAudioPlaybackThroughFigLog: [QE Critical][0x123|P/JK]: <0x456|I/A>: [AudioFormat qlac is  decodable] [AudioChannels 2] [Spatialization no] [StereoSpatialization no] [Rendition Lossless] [SampleRate 96000] [BitDepth 24] [Immersive rendering no]",
-        ]
+        let helper = RegressionTests()
+        let messages = [helper.current("I/A"), helper.rate("I/A", 1), helper.report("I/A", 96000)]
         return messages.enumerated().map { i, m in
             [
                 "processID": 123,
@@ -294,7 +294,7 @@ final class FailurePathTests: XCTestCase {
         e.onCancelHistory = { cancelled = true }
         e.receive(["eventType": "lossEvent", "machTimestamp": 200], pid: 123)
         for r in records(100) { e.receive(r, pid: 123, fromHistory: true) }
-        e.finish(success: true, pid: 123)
+        e.finish(success: true)
         XCTAssertTrue(cancelled)
         XCTAssertNil(e.target)
         XCTAssertGreaterThanOrEqual(e.lastStamp, 200)
@@ -313,7 +313,7 @@ final class FailurePathTests: XCTestCase {
         for r in records(100) { e.receive(r, pid: 123, fromHistory: true) }
         e.invalidate(suspended: true)
         XCTAssertEqual(cancellations, 1)
-        e.finish(success: true, pid: 123)
+        e.finish(success: true)
         for r in records(210) { e.receive(r, pid: 123) }
         XCTAssertNil(e.target)
         clock = 300
@@ -329,11 +329,168 @@ final class FailurePathTests: XCTestCase {
         let e = PlaybackEvidence(now: { 200 })
         e.begin()
         for r in records(100).reversed() { e.receive(r, pid: 123, fromHistory: true) }
-        e.finish(success: true, pid: 123)
+        e.finish(success: true)
         XCTAssertEqual(e.target?.rate, 96000)
         e.receive(["eventType": "lossEvent"], pid: 123)
         for r in records(100) { e.receive(r, pid: 123) }
         XCTAssertNil(e.target)
         XCTAssertGreaterThanOrEqual(e.lastStamp, 200)
     }
+
+    func testUntrustworthyCriticalRecordsRevokeTargetAndRequireFreshEvidence() {
+        let stop =
+            "<<<< FigStreamPlayer >>>> fpfs_StopPlayingItem: [0x123|P/JK] <0x456|I/A>: Stopping, err=(null)"
+        var bad = records(103)[0]
+        bad["eventMessage"] = stop
+        let invalidStamps: [Any?] = [
+            nil, -1, 1.5, true, "103", Double.nan, NSDecimalNumber(string: "18446744073709551616"),
+            102, 101,
+        ]
+        for stamp in invalidStamps {
+            let e = PlaybackEvidence(now: { 200 })
+            e.begin()
+            for r in records(100) { e.receive(r, pid: 123) }
+            e.finish(success: true)
+            XCTAssertNotNil(e.target)
+            bad["machTimestamp"] = stamp
+            e.receive(bad, pid: 123)
+            XCTAssertNil(e.target, "invalid stamp: \(String(describing: stamp))")
+            for r in records(150) { e.receive(r, pid: 123) }
+            XCTAssertNil(e.target)
+            for r in records(201) { e.receive(r, pid: 123) }
+            XCTAssertEqual(e.target?.rate, 96000, "fresh evidence must recover")
+        }
+    }
+
+    func testMissingTimestampDuringBootstrapCancelsHistory() {
+        let e = PlaybackEvidence(now: { 200 })
+        e.begin()
+        var cancelled = false
+        e.onCancelHistory = { cancelled = true }
+        for r in records(100) { e.receive(r, pid: 123, fromHistory: true) }
+        var change = records(103)[0]
+        change["machTimestamp"] = nil
+        change["eventMessage"] = (change["eventMessage"] as! String).replacingOccurrences(
+            of: "I/A", with: "I/B")
+        e.receive(change, pid: 123, fromHistory: true)
+        e.finish(success: true)
+        XCTAssertTrue(cancelled)
+        XCTAssertNil(e.target)
+    }
+
+    func testUnrelatedRecordsDoNotAdvanceEvidenceClock() {
+        let e = PlaybackEvidence(now: { 200 })
+        e.begin()
+        e.finish(success: true)
+        var unrelated = records(1000)[0]
+        unrelated["processID"] = 321
+        e.receive(unrelated, pid: 123)
+        unrelated["processID"] = 123
+        unrelated["eventMessage"] = "output sampleRate: 96000"
+        e.receive(unrelated, pid: 123)
+        for r in records(100) { e.receive(r, pid: 123) }
+        XCTAssertEqual(e.target?.rate, 96000)
+        XCTAssertEqual(e.lastStamp, 102)
+    }
+    func testInvalidEvidenceCannotConfigureNewOutput() {
+        let e = PlaybackEvidence(now: { 200 })
+        e.begin()
+        for r in records(100) { e.receive(r, pid: 123) }
+        e.finish(success: true)
+        let f = FakeAudio(writeLimit: 4)
+        f.partialFailure = false
+        let c = f.controller()
+        c.source = e.target
+        c.reconcile()
+        pump()
+        XCTAssertEqual(f.states[78]?.rate, 96000)
+        var preload = records(110)[2]
+        preload["eventMessage"] = (preload["eventMessage"] as! String).replacingOccurrences(
+            of: "I/A", with: "I/PRELOAD")
+        e.receive(preload, pid: 123)
+        var stoppedRecord = records(105)[1]
+        stoppedRecord["eventMessage"] = RegressionTests().rate("I/A", 0)
+        e.receive(stoppedRecord, pid: 123)  // Late stop after a newer preload.
+        XCTAssertNil(e.target)
+        c.source = e.target
+        f.selected = 85
+        f.notify()
+        pump()
+        XCTAssertEqual(
+            f.writtenStates,
+            [
+                {
+                    var s = FakeAudio.device()
+                    s.rate = 96000
+                    s.streams[0].physical.mSampleRate = 96000
+                    s.streams[0].virtual.mSampleRate = 96000
+                    return s
+                }(),
+                FakeAudio.device(),
+            ], "only A's original output is restored; the new output must not be configured")
+        XCTAssertEqual(f.states[85], FakeAudio.device(85, "headphones"))
+        for var r in records(201) {
+            r["eventMessage"] = (r["eventMessage"] as! String).replacingOccurrences(
+                of: "I/A", with: "I/B")
+            e.receive(r, pid: 123)
+            c.source = e.target
+            c.reconcile()
+        }
+        pump()
+        XCTAssertEqual(c.source?.item, "I/B")
+        XCTAssertEqual(f.writtenStates.map(\.id), [78, 78, 85])
+        XCTAssertEqual(f.states[85]?.rate, 96000)
+        stop(c)
+        XCTAssertEqual(f.writtenStates.last, FakeAudio.device(85, "headphones"))
+    }
+
+    func testMalformedCriticalMessagesAndTimestampCollisionsInvalidateReplay() {
+        let helper = RegressionTests()
+        let malformed = [
+            helper.current("I/B").replacingOccurrences(of: "<P/JK|", with: "<unknown|"),
+            helper.current("unrecognized-item"),
+            helper.rate("I/A", 0).replacingOccurrences(of: "0.000000", with: "nan"),
+            helper.report("I/A").replacingOccurrences(
+                of: "[BitDepth 24]", with: "[BitDepth unknown]"),
+        ]
+        for history in [false, true] {
+            for message in malformed + [helper.current("I/B")] {
+                let e = PlaybackEvidence(now: { 200 })
+                e.begin()
+                for r in records(100) { e.receive(r, pid: 123, fromHistory: history) }
+                if !history { e.finish(success: true) }
+                var bad = records(message == helper.current("I/B") ? 102 : 103)[0]
+                bad["eventMessage"] = message
+                e.receive(bad, pid: 123, fromHistory: history)
+                if history { XCTAssertFalse(e.finish(success: true)) }
+                XCTAssertNil(e.target)
+                XCTAssertEqual(e.lastStamp, 200)
+                for r in records(201) { e.receive(r, pid: 123) }
+                XCTAssertEqual(e.target?.rate, 96000)
+            }
+        }
+    }
+
+    func testExactDuplicateRetentionIsBoundedAndInvalidationClearsIt() {
+        let e = PlaybackEvidence(now: { 10000 })
+        e.begin()
+        for r in records(100) { e.receive(r, pid: 123) }
+        e.finish(success: true)
+        for r in records(100) { e.receive(r, pid: 123) }
+        XCTAssertEqual(e.target?.rate, 96000)
+        for stamp in 103...4198 {
+            var r = records(UInt64(stamp))[2]
+            r["eventMessage"] = RegressionTests().report("I/PRELOAD")
+            e.receive(r, pid: 123)
+        }
+        XCTAssertEqual(e.target?.rate, 96000)
+        e.receive(records(100)[0], pid: 123)
+        XCTAssertNil(e.target, "evicted records cannot be proven duplicates")
+        XCTAssertEqual(e.lastStamp, 10000)
+        e.receive(["eventType": "lossEvent", "machTimestamp": 9999], pid: 123)
+        XCTAssertEqual(e.lastStamp, 10000, "queued loss before the boundary is inert")
+        for r in records(10001) { e.receive(r, pid: 123) }
+        XCTAssertEqual(e.target?.rate, 96000)
+    }
+
 }

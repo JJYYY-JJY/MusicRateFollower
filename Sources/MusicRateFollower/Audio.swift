@@ -153,26 +153,29 @@ struct DeviceState: Equatable {
                         $0, kAudioStreamPropertyVirtualFormat, AudioStreamBasicDescription.self))
             })
     }
-    func target(_ sourceRate: Double) throws -> Self {
-        var usable = rateRanges(try HAL.rates(id))
+    func target(
+        _ sourceRate: Double,
+        nominalRates: (AudioDeviceID) throws -> [AudioValueRange] = HAL.rates,
+        streamFormats: (AudioStreamID, AudioObjectPropertySelector) throws ->
+            [AudioStreamRangedDescription] = {
+                try HAL.read($0, $1, AudioStreamRangedDescription.self)
+            }
+    ) throws -> Self {
+        var usable = rateRanges(try nominalRates(id))
         var formats: [[AudioStreamRangedDescription]] = []
         for s in streams {
             guard adequate(s.virtual) else { throw AudioFailure.unsupported }
-            let physical = try HAL.read(
-                s.id, kAudioStreamPropertyAvailablePhysicalFormats,
-                AudioStreamRangedDescription.self
-            )
-            .filter {
-                adequate($0.mFormat) && $0.mFormat.mChannelsPerFrame == s.physical.mChannelsPerFrame
-            }
-            let virtual = try HAL.read(
-                s.id, kAudioStreamPropertyAvailableVirtualFormats, AudioStreamRangedDescription.self
-            )
-            .filter { option in
-                var f = option.mFormat
-                f.mSampleRate = s.virtual.mSampleRate
-                return sameFormat(f, s.virtual)
-            }
+            let physical = try streamFormats(s.id, kAudioStreamPropertyAvailablePhysicalFormats)
+                .filter {
+                    adequate($0.mFormat)
+                        && $0.mFormat.mChannelsPerFrame == s.physical.mChannelsPerFrame
+                }
+            let virtual = try streamFormats(s.id, kAudioStreamPropertyAvailableVirtualFormats)
+                .filter { option in
+                    var f = option.mFormat
+                    f.mSampleRate = s.virtual.mSampleRate
+                    return sameFormat(f, s.virtual)
+                }
             usable = intersectRates(usable, rateRanges(physical.map(\.mSampleRateRange)))
             usable = intersectRates(usable, rateRanges(virtual.map(\.mSampleRateRange)))
             formats.append(physical)
@@ -270,7 +273,7 @@ final class AudioControl {
         var returning = false
         var faultRollback = false
         var token = UUID()
-        var sourceRate: Double?
+        var source: SourceFormat?
     }
     private var leases: [String: Lease] = [:]
     private var yielded: Set<String> = []
@@ -389,7 +392,7 @@ final class AudioControl {
                 leases[current.uid] ?? Lease(original: current, expected: current, before: current)
             l.before = current
             l.expected = target
-            l.sourceRate = s.rate
+            l.source = s
             leases[current.uid] = l
             begin(current.uid)
         } catch { onStatus?("unsupported-or-unreadable \(s.rate) Hz: \(error)") }
@@ -399,6 +402,9 @@ final class AudioControl {
         l.pending = true
         l.token = UUID()
         leases[uid] = l
+        onStatus?(
+            "write-start uid=\(uid) item=\(l.source?.item ?? "unknown") transaction=\(l.token) operation=\(l.returning ? "restore" : "align") output=\(l.expected.rate) Hz"
+        )
         do { try access.write(l.expected, l.before) } catch {
             onStatus?("write-failed: \(error)")
             // Roll back only an observed mixture of this transaction's own values.
@@ -456,7 +462,8 @@ final class AudioControl {
                     } else {
                         observed[uid] = actual
                         leases.removeValue(forKey: uid)
-                        onStatus?("restored \(l.original.rate) Hz")
+                        onStatus?(
+                            "restored \(l.original.rate) Hz uid=\(uid) transaction=\(l.token)")
                         if !enabled && leases.isEmpty { finish() }
                     }
                 } else {
@@ -464,8 +471,10 @@ final class AudioControl {
                     leases[uid] = l
                     onStatus?(
                         alignmentStatus(
-                            source: l.sourceRate ?? actual.rate, output: actual.rate, verified: true
-                        ))
+                            source: l.source?.rate ?? actual.rate, output: actual.rate,
+                            verified: true
+                        ) + " uid=\(uid) item=\(l.source?.item ?? "unknown") transaction=\(l.token)"
+                    )
                     if !enabled { restore(uid) }
                 }
                 DispatchQueue.main.async { [weak self] in self?.reconcile() }

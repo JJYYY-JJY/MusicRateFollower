@@ -2,109 +2,149 @@ import CoreAudio
 import Foundation
 
 @main struct LiveTests {
-    static func main() throws {
-        func check(_ value: Bool, _ message: String = "check failed") throws {
-            if !value {
-                throw NSError(
-                    domain: "LiveTest", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
-            }
+    static func check(_ value: Bool, _ message: String) throws {
+        if !value {
+            throw NSError(
+                domain: "LiveTest", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
         }
+    }
+    static func wait(_ message: String, until ready: () throws -> Bool) throws {
+        let deadline = Date().addingTimeInterval(3)
+        repeat {
+            if try ready() { return }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        } while Date() < deadline
+        try check(false, message)
+    }
+    static func stop(_ c: AudioControl) throws {
+        var done = false
+        c.stop { done = true }
+        try wait("restore did not complete") { done }
+    }
+    static func main() throws {
         setbuf(stdout, nil)
         let initialDefault = try HAL.defaultDevice()
         let states = try HAL.devices().compactMap { try? DeviceState.read($0) }
-        defer {
+        var active: AudioControl?
+        var failure: Error?
+        do {
             for original in states {
-                if let actual = try? DeviceState.read(original.id) {
-                    try? original.writeChanges(from: actual)
+                try HAL.write(1, kAudioHardwarePropertyDefaultOutputDevice, original.id)
+                try wait("default output did not switch") { try HAL.defaultDevice() == original.id }
+                let candidates: [Double] = [44100, 48000, 88200, 96000, 176400, 192000]
+                var targets: [(Double, DeviceState)] = []
+                var unsupported: [Double] = []
+                for source in candidates {
+                    do { targets.append((source, try original.target(source))) } catch AudioFailure
+                        .unsupported
+                    { unsupported.append(source) }
                 }
-            }
-            try? HAL.write(1, kAudioHardwarePropertyDefaultOutputDevice, initialDefault)
-        }
-        func pump(_ seconds: Double = 0.5) {
-            RunLoop.main.run(until: Date().addingTimeInterval(seconds))
-        }
-        func stop(_ c: AudioControl) throws {
-            var done = false
-            c.stop { done = true }
-            pump(1.2)
-            try check(done, "restore did not complete")
-        }
-        for original in states {
-            try HAL.write(1, kAudioHardwarePropertyDefaultOutputDevice, original.id)
-            pump()
-            var lines: [String] = []
-            let c = AudioControl()
-            c.onStatus = {
-                lines.append($0)
-                print(original.id, $0)
-            }
-            c.start()
-            let rate: Double = original.rate == 44100 ? 48000 : 44100
-            c.source = SourceFormat(rate: rate, bits: 24, item: "live-test-1")
-            c.reconcile()
-            pump()
-            try check(try DeviceState.read(original.id).rate == rate)
-            let writes = lines.filter { $0.hasPrefix("aligned-verified") }.count
-            for _ in 0..<20 { c.reconcile() }
-            pump()
-            try check(lines.filter { $0.hasPrefix("aligned-verified") }.count == writes)
-            let maximum = try HAL.rates(original.id).map(\.mMaximum).max()!
-            c.source = SourceFormat(rate: 192000, bits: 24, item: "integer-fallback")
-            c.reconcile()
-            pump()
-            try check(
-                try DeviceState.read(original.id).rate == maximum,
-                "192 kHz fallback did not reach supported maximum")
-            let fallbackWrites = lines.filter { $0.hasPrefix("downsampled-verified") }.count
-            for _ in 0..<20 { c.reconcile() }
-            pump()
-            try check(lines.filter { $0.hasPrefix("downsampled-verified") }.count == fallbackWrites)
-            c.source = SourceFormat(rate: 176400, bits: 24, item: "integer-fallback-441-family")
-            c.reconcile()
-            pump()
-            let ranges = try HAL.rates(original.id)
-            let expected176 = (1...512).map { 176400.0 / Double($0) }.first { rate in
-                ranges.contains { $0.mMinimum <= rate && rate <= $0.mMaximum }
-            }!
-            try check(try DeviceState.read(original.id).rate == expected176)
-            c.source = SourceFormat(rate: rate, bits: 24, item: "return-before-unsupported")
-            c.reconcile()
-            pump()
-            c.source = SourceFormat(rate: 32000, bits: 24, item: "unsupported")
-            c.reconcile()
-            pump()
-            try check(try DeviceState.read(original.id).rate == rate)
-            c.source = SourceFormat(rate: original.rate, bits: 24, item: "live-test-2")
-            c.reconcile()
-            pump()
-            c.source = SourceFormat(rate: rate, bits: 24, item: "live-test-3")
-            c.reconcile()
-            pump()
-            try stop(c)
-            try check(
-                try DeviceState.read(original.id) == original, "did not restore first snapshot")
-            print(
-                "PASS", original.id,
-                "192/176.4 kHz fallback, repeat suppression, unsupported, multi-track first-snapshot restore"
-            )
+                guard !targets.isEmpty else {
+                    print("SKIP", original.uid, "no controllable lossless source formats")
+                    continue
+                }
+                var lines: [String] = []
+                let c = AudioControl()
+                active = c
+                c.onStatus = {
+                    lines.append($0)
+                    print(Date(), original.uid, $0)
+                }
+                c.start()
+                for (source, expected) in targets {
+                    c.source = SourceFormat(rate: source, bits: 24, item: "backend-\(source)")
+                    c.reconcile()
+                    try wait("full format was not verified for \(source)") {
+                        try DeviceState.read(original.id) == expected
+                    }
+                    let writes = lines.filter { $0.hasPrefix("write-start") }.count
+                    for _ in 0..<20 { c.reconcile() }
+                    RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+                    try check(
+                        lines.filter { $0.hasPrefix("write-start") }.count == writes,
+                        "duplicate write")
+                    print(
+                        "PASS", original.uid, "source", source, "output", expected.rate,
+                        "full format and repeat suppression")
+                }
+                let beforeUnsupported = try DeviceState.read(original.id)
+                let writes = lines.filter { $0.hasPrefix("write-start") }.count
+                for source in unsupported {
+                    c.source = SourceFormat(rate: source, bits: 24, item: "unsupported-\(source)")
+                    c.reconcile()
+                }
+                try check(
+                    lines.filter { $0.hasPrefix("write-start") }.count == writes,
+                    "unsupported source wrote settings")
+                try check(
+                    try DeviceState.read(original.id) == beforeUnsupported,
+                    "unsupported source changed format")
+                if unsupported.isEmpty {
+                    print("SKIP", original.uid, "no unsupported source among verified source rates")
+                }
+                try stop(c)
+                active = nil
+                try check(
+                    try DeviceState.read(original.id) == original, "did not restore first snapshot")
+                print("PASS", original.uid, "multi-track first-snapshot restore")
 
-            let yielded = AudioControl()
-            yielded.onStatus = { print(original.id, $0) }
-            yielded.start()
-            yielded.source = SourceFormat(rate: original.rate, bits: 24, item: "already-aligned")
-            yielded.reconcile()
-            pump()
-            try HAL.write(original.id, kAudioDevicePropertyNominalSampleRate, rate)
-            pump()
-            yielded.source = SourceFormat(rate: original.rate, bits: 24, item: "after-user-change")
-            yielded.reconcile()
-            pump()
-            try check(try DeviceState.read(original.id).rate == rate)
-            try stop(yielded)
-            try check(try DeviceState.read(original.id).rate == rate)
-            try original.writeChanges(from: DeviceState.read(original.id))
-            pump()
-            print("PASS", original.id, "external change while already aligned is preserved")
+                guard let (source, alternate) = targets.first(where: { $0.1 != original }) else {
+                    print("SKIP", original.uid, "no alternate full format for external takeover")
+                    continue
+                }
+                active = c
+                c.start()
+                c.source = nil
+                c.reconcile()  // Observe the device before an external writer changes it.
+                try alternate.writeChanges(from: original)
+                try wait("external change not observed") {
+                    try DeviceState.read(original.id) == alternate
+                        && lines.contains { $0.hasPrefix("yielded:") }
+                }
+                c.source = SourceFormat(rate: source, bits: 24, item: "after-external-change")
+                let externalWrites = lines.filter { $0.hasPrefix("write-start") }.count
+                c.reconcile()
+                try stop(c)
+                active = nil
+                try check(
+                    lines.filter { $0.hasPrefix("write-start") }.count == externalWrites,
+                    "reacquired external control")
+                try check(
+                    try DeviceState.read(original.id) == alternate,
+                    "external change was overwritten")
+                print("PASS", original.uid, "external change preserved through stop")
+            }
+        } catch { failure = error }
+        if let active {
+            do { try stop(active) } catch {
+                print("FAIL controller cleanup", error)
+                failure = error
+            }
         }
+        // Attempt every snapshot even if a previous test or cleanup failed.
+        for original in states {
+            do {
+                let actual = try DeviceState.read(original.id)
+                try check(actual.uid == original.uid, "device ID now belongs to another UID")
+                try original.writeChanges(from: actual)
+                try wait("snapshot restore did not settle") {
+                    try DeviceState.read(original.id) == original
+                }
+            } catch {
+                print("FAIL snapshot restore", original.uid, error)
+                failure = error
+            }
+        }
+        do {
+            try HAL.write(1, kAudioHardwarePropertyDefaultOutputDevice, initialDefault)
+            try wait("default output restore did not settle") {
+                try HAL.defaultDevice() == initialDefault
+            }
+        } catch {
+            print("FAIL default output restore", error)
+            failure = error
+        }
+        if let failure { throw failure }
+        print("PASS all original device snapshots and default output restored")
     }
 }
